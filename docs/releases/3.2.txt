@@ -251,6 +251,13 @@ Management Commands
   prior to executing the command. In previous versions, either all or none
   of the system checks were performed.
 
+Middleware
+~~~~~~~~~~
+
+* Individual views may now be excluded from the :setting:`APPEND_SLASH`
+  behavior by setting a ``_should_append_slash`` attribute on the view itself.
+  See :class:`~django.middleware.common.CommonMiddleware` for details.
+
 Migrations
 ~~~~~~~~~~
 
