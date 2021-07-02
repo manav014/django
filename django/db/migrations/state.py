@@ -1,5 +1,5 @@
 import copy
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from contextlib import contextmanager
 from functools import partial
 
@@ -19,6 +19,8 @@ from django.utils.version import get_docs_version
 
 from .exceptions import InvalidBasesError
 from .utils import resolve_relation
+
+FieldRelation = namedtuple('FieldRelation', ['from_field', 'to_app_label', 'to_model_name', 'to_field'])
 
 
 def _get_app_label_and_model_name(model, app_label=''):
@@ -88,21 +90,52 @@ class ProjectState:
     FKs/etc. resolve properly.
     """
 
-    def __init__(self, models=None, real_apps=None):
+    def __init__(self, models=None, real_apps=None, related_fields=None):
         self.models = models or {}
         # Apps to include from main registry, usually unmigrated ones
         self.real_apps = real_apps or []
+        self.related_fields = related_fields or {}
         self.is_delayed = False
         # {remote_model_key: {model_key: [(field_name, field)]}}
         self.relations = None
 
     def add_model(self, model_state):
+        for name, field in model_state.fields.items():
+            if field.is_relation:
+                from_app_label = model_state.app_label
+                from_model_name = model_state.name_lower
+                from_field = name.lower()
+                if '.' not in field.remote_field.model:
+                    to_app_label = model_state.app_label
+                    to_model_name = field.remote_field.model
+                else:
+                    to_app_label = field.remote_field.model.split(".")[0]
+                    to_model_name = field.remote_field.model.split(".")[1]
+                # to_field would be the through model name in case of m2m and to_fields in case of foreign keys
+                to_field = field.remote_field.through or \
+                    "_".join((model_state.name_lower, name.lower())) if field.many_to_many else tuple(
+                        field.to_fields)
+                try:
+                    self.related_fields[(model_state.app_label, model_state.name_lower)]. \
+                        add(FieldRelation(from_field, to_app_label, to_model_name, to_field))
+                except KeyError:
+                    self.related_fields[(from_app_label, from_model_name)] = \
+                        {FieldRelation(from_field, to_app_label, to_model_name, to_field)}
         app_label, model_name = model_state.app_label, model_state.name_lower
         self.models[(app_label, model_name)] = model_state
         if 'apps' in self.__dict__:  # hasattr would cache the property
             self.reload_model(app_label, model_name)
 
     def remove_model(self, app_label, model_name):
+        relations_to_remove = []
+        for relations in self.related_fields.values():
+            for relation in relations:
+                if relation.to_model_name == model_name.lower():
+                    relations_to_remove.append(relation)
+            relations.difference_update(relations_to_remove)
+            relations_to_remove = []
+        if (app_label, model_name) in self.related_fields:
+            self.related_fields.pop((app_label, model_name))
         del self.models[app_label, model_name]
         if 'apps' in self.__dict__:  # hasattr would cache the property
             self.apps.unregister_model(app_label, model_name)
@@ -133,6 +166,23 @@ class ProjectState:
             if changed_field:
                 model_state.fields[name] = changed_field
                 to_reload.add((model_state.app_label, model_state.name_lower))
+
+        for relations in self.related_fields.values():
+            relations_to_remove = []
+            relations_to_add = []
+            for relation in relations:
+                if relation.to_model_name == old_name.lower():
+                    relations_to_add.append(FieldRelation(relation.from_field,
+                                            relation.to_app_label, new_name.lower(), relation.to_field))
+                    relations_to_remove.append(relation)
+            for relation in relations_to_remove:
+                relations.remove(relation)
+            for relation in relations_to_add:
+                relations.add(relation)
+
+        if (app_label, old_name.lower()) in self.related_fields:
+            self.related_fields[(app_label, new_name.lower())] = self.related_fields[(app_label, old_name.lower())]
+            self.related_fields.pop((app_label, old_name.lower()))
         # Reload models related to old model before removing the old model.
         self.reload_models(to_reload, delay=True)
         # Remove the old model.
@@ -183,6 +233,27 @@ class ProjectState:
             field.default = NOT_PROVIDED
         else:
             field = field
+
+        if field.is_relation:
+            from_app_label = app_label
+            from_model_name = model_name.lower()
+            if '.' not in field.remote_field.model:
+                to_app_label = app_label
+                to_model_name = field.remote_field.model
+            else:
+                to_app_label = field.remote_field.model.split(".")[0]
+                to_model_name = field.remote_field.model.split(".")[1]
+                # to_field would be the through model name in case of m2m and to_fields in case of foreign keys
+            to_field = field.remote_field.through or \
+                "_".join((model_name.lower(), name.lower())) if field.many_to_many else tuple(
+                    field.to_fields)
+            try:
+                self.related_fields[(app_label, model_name.lower())]. \
+                    add(FieldRelation(name.lower(), to_app_label, to_model_name, to_field))
+            except KeyError:
+                self.related_fields[(from_app_label, from_model_name)] = \
+                    {FieldRelation(name.lower(), to_app_label, to_model_name, to_field)}
+
         self.models[app_label, model_name].fields[name] = field
         # Delay rendering of relationships if it's not a relational field.
         delay = not field.is_relation
@@ -191,6 +262,13 @@ class ProjectState:
     def remove_field(self, app_label, model_name, name):
         model_state = self.models[app_label, model_name]
         old_field = model_state.fields.pop(name)
+        relations_to_remove = []
+        for relations in self.related_fields.values():
+            for relation in relations:
+                if relation.from_field == name.lower() or relation.to_field == name.lower():
+                    relations_to_remove.append(relation)
+            relations.difference_update(relations_to_remove)
+            relations_to_remove = []
         # Delay rendering of relationships if it's not a relational field.
         delay = not old_field.is_relation
         self.reload_model(app_label, model_name, delay=delay)
@@ -254,6 +332,24 @@ class ProjectState:
                         new_name if to_field_name == old_name else to_field_name
                         for to_field_name in to_fields
                     ])
+        relations_to_remove = []
+        relations_to_add = []
+        for relations in self.related_fields.values():
+            for relation in relations:
+                if relation.from_field == old_name.lower():
+                    relations_to_add.append(FieldRelation(new_name.lower(),
+                                            relation.to_app_label, relation.to_model_name, relation.to_field))
+                    relations_to_remove.append(relation)
+                elif relation.to_field == old_name.lower():
+                    relations_to_add.append(FieldRelation(
+                        relation.from_field, relation.to_app_label, relation.to_model_name, new_name.lower()))
+                    relations_to_remove.append(relation)
+            for relation in relations_to_remove:
+                relations.remove(relation)
+            for relation in relations_to_add:
+                relations.add(relation)
+            relations_to_remove = []
+            relations_to_add = []
         self.reload_model(app_label, model_name, delay=delay)
 
     def _find_reload_model(self, app_label, model_name, delay=False):
