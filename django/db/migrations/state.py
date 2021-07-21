@@ -1,5 +1,5 @@
 import copy
-from collections import defaultdict, namedtuple
+from collections import defaultdict
 from contextlib import contextmanager
 from functools import partial
 
@@ -19,8 +19,6 @@ from django.utils.version import get_docs_version
 
 from .exceptions import InvalidBasesError
 from .utils import resolve_relation
-
-FieldRelation = namedtuple('FieldRelation', ['from_field', 'to_app_label', 'to_model_name', 'to_field'])
 
 
 def _get_app_label_and_model_name(model, app_label=''):
@@ -90,58 +88,36 @@ class ProjectState:
     FKs/etc. resolve properly.
     """
 
-    def __init__(self, models=None, real_apps=None, related_fields=None):
+    def __init__(self, models=None, real_apps=None):
         self.models = models or {}
         # Apps to include from main registry, usually unmigrated ones
         self.real_apps = real_apps or []
-        self.related_fields = related_fields or {}
         self.is_delayed = False
         # {remote_model_key: {model_key: [(field_name, field)]}}
         self.relations = None
+        self.resolve_fields_and_relations()
 
     def add_model(self, model_state):
-        for name, field in model_state.fields.items():
-            if field.is_relation:
-                from_app_label = model_state.app_label
-                from_model_name = model_state.name_lower
-                from_field = name.lower()
-                if '.' not in field.remote_field.model:
-                    to_app_label = model_state.app_label
-                    to_model_name = field.remote_field.model
-                else:
-                    to_app_label = field.remote_field.model.split(".")[0]
-                    to_model_name = field.remote_field.model.split(".")[1]
-                # to_field would be the through model name in case of m2m and to_fields in case of foreign keys
-                to_field = field.remote_field.through or \
-                    "_".join((model_state.name_lower, name.lower())) if field.many_to_many else tuple(
-                        field.to_fields)
-                try:
-                    self.related_fields[(model_state.app_label, model_state.name_lower)]. \
-                        add(FieldRelation(from_field, to_app_label, to_model_name, to_field))
-                except KeyError:
-                    self.related_fields[(from_app_label, from_model_name)] = \
-                        {FieldRelation(from_field, to_app_label, to_model_name, to_field)}
         app_label, model_name = model_state.app_label, model_state.name_lower
         self.models[(app_label, model_name)] = model_state
+        concretes, _ = self._get_concrete_models_mapping_and_proxy_models()
+        self.populate_relation_from_model_state(model_state, (app_label, model_name), concretes)
         if 'apps' in self.__dict__:  # hasattr would cache the property
             self.reload_model(app_label, model_name)
 
     def remove_model(self, app_label, model_name):
-        relations_to_remove = []
-        for relations in self.related_fields.values():
-            for relation in relations:
-                if relation.to_model_name == model_name.lower():
-                    relations_to_remove.append(relation)
-            relations.difference_update(relations_to_remove)
-            relations_to_remove = []
-        if (app_label, model_name) in self.related_fields:
-            self.related_fields.pop((app_label, model_name))
         del self.models[app_label, model_name]
         if 'apps' in self.__dict__:  # hasattr would cache the property
             self.apps.unregister_model(app_label, model_name)
             # Need to do this explicitly since unregister_model() doesn't clear
             # the cache automatically (#24513)
             self.apps.clear_cache()
+            self.relations.pop((app_label, model_name), '')
+            relations = copy.copy(self.relations)
+            for key, relation in relations.items():
+                self.relations[key].pop((app_label, model_name), '')
+                if relation == defaultdict(list):
+                    self.relations.pop(key)
 
     def rename_model(self, app_label, old_name, new_name):
         # Add a new model.
@@ -166,25 +142,18 @@ class ProjectState:
             if changed_field:
                 model_state.fields[name] = changed_field
                 to_reload.add((model_state.app_label, model_state.name_lower))
-
-        for relations in self.related_fields.values():
-            relations_to_remove = []
-            relations_to_add = []
-            for relation in relations:
-                if relation.to_model_name == old_name.lower():
-                    relations_to_add.append(FieldRelation(relation.from_field,
-                                            relation.to_app_label, new_name.lower(), relation.to_field))
-                    relations_to_remove.append(relation)
-            for relation in relations_to_remove:
-                relations.remove(relation)
-            for relation in relations_to_add:
-                relations.add(relation)
-
-        if (app_label, old_name.lower()) in self.related_fields:
-            self.related_fields[(app_label, new_name.lower())] = self.related_fields[(app_label, old_name.lower())]
-            self.related_fields.pop((app_label, old_name.lower()))
         # Reload models related to old model before removing the old model.
         self.reload_models(to_reload, delay=True)
+        old_name_key = (app_label, old_name.lower())
+        new_name_key = (app_label, new_name.lower())
+        if (app_label, old_name.lower()) in self.relations:
+            self.relations[new_name_key] = self.relations[old_name_key]
+            self.relations.pop(old_name_key, '')
+        relations = copy.copy(self.relations)
+        for key, relation in relations.items():
+            if old_name_key in relation:
+                self.relations[key][new_name_key] = relation[old_name_key]
+                self.relations[key].pop(old_name_key, '')
         # Remove the old model.
         self.remove_model(app_label, old_name_lower)
         self.reload_model(app_label, new_name_lower, delay=True)
@@ -233,28 +202,22 @@ class ProjectState:
             field.default = NOT_PROVIDED
         else:
             field = field
-
-        if field.is_relation:
-            from_app_label = app_label
-            from_model_name = model_name.lower()
-            if '.' not in field.remote_field.model:
-                to_app_label = app_label
-                to_model_name = field.remote_field.model
-            else:
-                to_app_label = field.remote_field.model.split(".")[0]
-                to_model_name = field.remote_field.model.split(".")[1]
-                # to_field would be the through model name in case of m2m and to_fields in case of foreign keys
-            to_field = field.remote_field.through or \
-                "_".join((model_name.lower(), name.lower())) if field.many_to_many else tuple(
-                    field.to_fields)
-            try:
-                self.related_fields[(app_label, model_name.lower())]. \
-                    add(FieldRelation(name.lower(), to_app_label, to_model_name, to_field))
-            except KeyError:
-                self.related_fields[(from_app_label, from_model_name)] = \
-                    {FieldRelation(name.lower(), to_app_label, to_model_name, to_field)}
-
         self.models[app_label, model_name].fields[name] = field
+        remote_field = field.remote_field
+        if remote_field:
+            model_key = (app_label, model_name)
+            concretes, _ = self._get_concrete_models_mapping_and_proxy_models()
+            real_apps = set(self.real_apps)
+            remote_model_key = resolve_relation(remote_field.model, *model_key)
+            if remote_model_key[0] not in real_apps and remote_model_key in concretes:
+                remote_model_key = concretes[remote_model_key]
+            self.relations[remote_model_key][model_key].append((name, field))
+            through = getattr(remote_field, 'through', None)
+            if through:
+                through_model_key = resolve_relation(through, *model_key)
+                if through_model_key[0] not in real_apps and through_model_key in concretes:
+                    through_model_key = concretes[through_model_key]
+                self.relations[through_model_key][model_key].append((name, field))
         # Delay rendering of relationships if it's not a relational field.
         delay = not field.is_relation
         self.reload_model(app_label, model_name, delay=delay)
@@ -262,14 +225,30 @@ class ProjectState:
     def remove_field(self, app_label, model_name, name):
         model_state = self.models[app_label, model_name]
         old_field = model_state.fields.pop(name)
-        relations_to_remove = []
-        for relations in self.related_fields.values():
-            for relation in relations:
-                if relation.from_field == name.lower() or relation.to_field == name.lower():
-                    relations_to_remove.append(relation)
-            relations.difference_update(relations_to_remove)
-            relations_to_remove = []
-        # Delay rendering of relationships if it's not a relational field.
+        remote_field = old_field.remote_field
+        if remote_field:
+            model_key = (app_label, model_name)
+            concretes, _ = self._get_concrete_models_mapping_and_proxy_models()
+            real_apps = set(self.real_apps)
+            remote_model_key = resolve_relation(remote_field.model, *model_key)
+            if remote_model_key[0] not in real_apps and remote_model_key in concretes:
+                remote_model_key = concretes[remote_model_key]
+            self.relations[remote_model_key][model_key].remove((name, old_field))
+            if self.relations[remote_model_key][model_key] == []:
+                self.relations[remote_model_key].pop(model_key)
+                if self.relations[remote_model_key] == defaultdict(list):
+                    self.relations.pop(remote_model_key)
+            through = getattr(remote_field, 'through', None)
+            if through:
+                through_model_key = resolve_relation(through, *model_key)
+                if through_model_key[0] not in real_apps and through_model_key in concretes:
+                    through_model_key = concretes[through_model_key]
+                self.relations[through_model_key][model_key].remove((name, old_field))
+                if self.relations[through_model_key][model_key] == []:
+                    self.relations[through_model_key].pop(model_key)
+                    if self.relations[through_model_key] == defaultdict(list):
+                        self.relations.pop(through_model_key)
+        # Delay rendering of relationships if it's not a relational field
         delay = not old_field.is_relation
         self.reload_model(app_label, model_name, delay=delay)
 
@@ -332,25 +311,17 @@ class ProjectState:
                         new_name if to_field_name == old_name else to_field_name
                         for to_field_name in to_fields
                     ])
-        relations_to_remove = []
-        relations_to_add = []
-        for relations in self.related_fields.values():
-            for relation in relations:
-                if relation.from_field == old_name.lower():
-                    relations_to_add.append(FieldRelation(new_name.lower(),
-                                            relation.to_app_label, relation.to_model_name, relation.to_field))
-                    relations_to_remove.append(relation)
-                elif relation.to_field == old_name.lower():
-                    relations_to_add.append(FieldRelation(
-                        relation.from_field, relation.to_app_label, relation.to_model_name, new_name.lower()))
-                    relations_to_remove.append(relation)
-            for relation in relations_to_remove:
-                relations.remove(relation)
-            for relation in relations_to_add:
-                relations.add(relation)
-            relations_to_remove = []
-            relations_to_add = []
         self.reload_model(app_label, model_name, delay=delay)
+        relations = copy.copy(self.relations)
+        model_key = (app_label, model_name)
+        for key, relation in relations.items():
+            if model_key in relation:
+                for field in self.relations[key][model_key]:
+                    if field[0] == old_name.lower():
+                        field[1].name = new_name.lower()
+                        self.relations[key][model_key].append((new_name.lower(), field[1]))
+                        self.relations[key][model_key].remove((field[0], field[1]))
+                        break
 
     def _find_reload_model(self, app_label, model_name, delay=False):
         if delay:
@@ -438,6 +409,25 @@ class ProjectState:
         # Render all models
         self.apps.render_multiple(states_to_be_rendered)
 
+    def populate_relation_from_model_state(self, model_state, model_key, concretes):
+        real_apps = set(self.real_apps)
+        for field_name, field in model_state.fields.items():
+            remote_field = field.remote_field
+            if not remote_field:
+                continue
+            remote_model_key = resolve_relation(remote_field.model, *model_key)
+            if remote_model_key[0] not in real_apps and remote_model_key in concretes:
+                remote_model_key = concretes[remote_model_key]
+            self.relations[remote_model_key][model_key].append((field_name, field))
+
+            through = getattr(remote_field, 'through', None)
+            if not through:
+                continue
+            through_model_key = resolve_relation(through, *model_key)
+            if through_model_key[0] not in real_apps and through_model_key in concretes:
+                through_model_key = concretes[through_model_key]
+            self.relations[through_model_key][model_key].append((field_name, field))
+
     def resolve_fields_and_relations(self):
         # Resolve fields.
         for model_state in self.models.values():
@@ -447,26 +437,9 @@ class ProjectState:
         # {remote_model_key: {model_key: [(field_name, field)]}}
         self.relations = defaultdict(partial(defaultdict, list))
         concretes, proxies = self._get_concrete_models_mapping_and_proxy_models()
-
-        real_apps = set(self.real_apps)
         for model_key in concretes:
             model_state = self.models[model_key]
-            for field_name, field in model_state.fields.items():
-                remote_field = field.remote_field
-                if not remote_field:
-                    continue
-                remote_model_key = resolve_relation(remote_field.model, *model_key)
-                if remote_model_key[0] not in real_apps and remote_model_key in concretes:
-                    remote_model_key = concretes[remote_model_key]
-                self.relations[remote_model_key][model_key].append((field_name, field))
-
-                through = getattr(remote_field, 'through', None)
-                if not through:
-                    continue
-                through_model_key = resolve_relation(through, *model_key)
-                if through_model_key[0] not in real_apps and through_model_key in concretes:
-                    through_model_key = concretes[through_model_key]
-                self.relations[through_model_key][model_key].append((field_name, field))
+            self.populate_relation_from_model_state(model_state, model_key, concretes)
         for model_key in proxies:
             self.relations[model_key] = self.relations[concretes[model_key]]
 
