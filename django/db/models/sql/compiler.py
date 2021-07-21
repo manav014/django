@@ -1,4 +1,5 @@
 import collections
+import json
 import re
 from functools import partial
 from itertools import chain
@@ -1222,15 +1223,11 @@ class SQLCompiler:
             chunk_size,
         )
         if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
-            try:
-                # If we are using non-chunked reads, we return the same data
-                # structure as normally, but ensure it is all read into memory
-                # before going any further. Use chunked_fetch if requested,
-                # unless the database doesn't support it.
-                return list(result)
-            finally:
-                # done with the cursor
-                cursor.close()
+            # If we are using non-chunked reads, we return the same data
+            # structure as normally, but ensure it is all read into memory
+            # before going any further. Use chunked_fetch if requested,
+            # unless the database doesn't support it.
+            return list(result)
         return result
 
     def as_subquery_condition(self, alias, columns, compiler):
@@ -1250,9 +1247,10 @@ class SQLCompiler:
         result = list(self.execute_sql())
         # Some backends return 1 item tuples with strings, and others return
         # tuples with integers and strings. Flatten them out into strings.
+        output_formatter = json.dumps if self.query.explain_format == 'json' else str
         for row in result[0]:
             if not isinstance(row, str):
-                yield ' '.join(str(c) for c in row)
+                yield ' '.join(output_formatter(c) for c in row)
             else:
                 yield row
 

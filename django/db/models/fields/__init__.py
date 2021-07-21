@@ -392,13 +392,13 @@ class Field(RegisterLookupMixin):
         return []
 
     def get_col(self, alias, output_field=None):
-        if output_field is None:
-            output_field = self
-        if alias != self.model._meta.db_table or output_field != self:
-            from django.db.models.expressions import Col
-            return Col(alias, self, output_field)
-        else:
+        if (
+            alias == self.model._meta.db_table and
+            (output_field is None or output_field == self)
+        ):
             return self.cached_col
+        from django.db.models.expressions import Col
+        return Col(alias, self, output_field)
 
     @cached_property
     def cached_col(self):
@@ -2484,10 +2484,11 @@ class AutoFieldMixin:
         return value
 
     def contribute_to_class(self, cls, name, **kwargs):
-        assert not cls._meta.auto_field, (
-            "Model %s can't have more than one auto-generated field."
-            % cls._meta.label
-        )
+        if cls._meta.auto_field:
+            raise ValueError(
+                "Model %s can't have more than one auto-generated field."
+                % cls._meta.label
+            )
         super().contribute_to_class(cls, name, **kwargs)
         cls._meta.auto_field = self
 

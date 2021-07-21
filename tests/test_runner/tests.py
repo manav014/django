@@ -1,6 +1,7 @@
 """
 Tests for django test runner
 """
+import collections.abc
 import unittest
 from unittest import mock
 
@@ -14,7 +15,9 @@ from django.core.management.base import SystemCheckError
 from django.test import (
     SimpleTestCase, TransactionTestCase, skipUnlessDBFeature,
 )
-from django.test.runner import DiscoverRunner, reorder_tests
+from django.test.runner import (
+    DiscoverRunner, Shuffler, reorder_test_bin, reorder_tests, shuffle_tests,
+)
 from django.test.testcases import connections_support_transactions
 from django.test.utils import (
     captured_stderr, dependency_ordered, get_unique_databases_and_mirrors,
@@ -125,6 +128,94 @@ class TestSuiteTests(SimpleTestCase):
         tests = list(iter_test_cases(suite))
         self.assertEqual(len(tests), 4)
         self.assertNotIsInstance(tests[0], unittest.TestSuite)
+
+    def make_tests(self):
+        """Return an iterable of tests."""
+        suite = self.make_test_suite()
+        tests = list(iter_test_cases(suite))
+        return tests
+
+    def test_shuffle_tests(self):
+        tests = self.make_tests()
+        # Choose a seed that shuffles both the classes and methods.
+        shuffler = Shuffler(seed=9)
+        shuffled_tests = shuffle_tests(tests, shuffler)
+        self.assertIsInstance(shuffled_tests, collections.abc.Iterator)
+        self.assertTestNames(shuffled_tests, expected=[
+            'Tests2.test1', 'Tests2.test2', 'Tests1.test2', 'Tests1.test1',
+        ])
+
+    def test_reorder_test_bin_no_arguments(self):
+        tests = self.make_tests()
+        reordered_tests = reorder_test_bin(tests)
+        self.assertIsInstance(reordered_tests, collections.abc.Iterator)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests1.test1', 'Tests1.test2', 'Tests2.test1', 'Tests2.test2',
+        ])
+
+    def test_reorder_test_bin_reverse(self):
+        tests = self.make_tests()
+        reordered_tests = reorder_test_bin(tests, reverse=True)
+        self.assertIsInstance(reordered_tests, collections.abc.Iterator)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests2.test2', 'Tests2.test1', 'Tests1.test2', 'Tests1.test1',
+        ])
+
+    def test_reorder_test_bin_random(self):
+        tests = self.make_tests()
+        # Choose a seed that shuffles both the classes and methods.
+        shuffler = Shuffler(seed=9)
+        reordered_tests = reorder_test_bin(tests, shuffler=shuffler)
+        self.assertIsInstance(reordered_tests, collections.abc.Iterator)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests2.test1', 'Tests2.test2', 'Tests1.test2', 'Tests1.test1',
+        ])
+
+    def test_reorder_test_bin_random_and_reverse(self):
+        tests = self.make_tests()
+        # Choose a seed that shuffles both the classes and methods.
+        shuffler = Shuffler(seed=9)
+        reordered_tests = reorder_test_bin(tests, shuffler=shuffler, reverse=True)
+        self.assertIsInstance(reordered_tests, collections.abc.Iterator)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests1.test1', 'Tests1.test2', 'Tests2.test2', 'Tests2.test1',
+        ])
+
+    def test_reorder_tests_same_type_consecutive(self):
+        """Tests of the same type are made consecutive."""
+        tests = self.make_tests()
+        # Move the last item to the front.
+        tests.insert(0, tests.pop())
+        self.assertTestNames(tests, expected=[
+            'Tests2.test2', 'Tests1.test1', 'Tests1.test2', 'Tests2.test1',
+        ])
+        reordered_tests = reorder_tests(tests, classes=[])
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests2.test2', 'Tests2.test1', 'Tests1.test1', 'Tests1.test2',
+        ])
+
+    def test_reorder_tests_random(self):
+        tests = self.make_tests()
+        # Choose a seed that shuffles both the classes and methods.
+        shuffler = Shuffler(seed=9)
+        reordered_tests = reorder_tests(tests, classes=[], shuffler=shuffler)
+        self.assertIsInstance(reordered_tests, collections.abc.Iterator)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests2.test1', 'Tests2.test2', 'Tests1.test2', 'Tests1.test1',
+        ])
+
+    def test_reorder_tests_random_mixed_classes(self):
+        tests = self.make_tests()
+        # Move the last item to the front.
+        tests.insert(0, tests.pop())
+        shuffler = Shuffler(seed=9)
+        self.assertTestNames(tests, expected=[
+            'Tests2.test2', 'Tests1.test1', 'Tests1.test2', 'Tests2.test1',
+        ])
+        reordered_tests = reorder_tests(tests, classes=[], shuffler=shuffler)
+        self.assertTestNames(reordered_tests, expected=[
+            'Tests2.test1', 'Tests2.test2', 'Tests1.test2', 'Tests1.test1',
+        ])
 
     def test_reorder_tests_reverse_with_duplicates(self):
         class Tests1(unittest.TestCase):
@@ -643,3 +734,42 @@ class RunTestsExceptionHandlingTests(unittest.TestCase):
                     runner.run_tests(['test_runner_apps.sample.tests_sample.TestDjangoTestCase'])
             self.assertTrue(teardown_databases.called)
             self.assertFalse(teardown_test_environment.called)
+
+
+# RemovedInDjango50Warning
+class NoOpTestRunner(DiscoverRunner):
+    def setup_test_environment(self, **kwargs):
+        return
+
+    def setup_databases(self, **kwargs):
+        return
+
+    def run_checks(self, databases):
+        return
+
+    def teardown_databases(self, old_config, **kwargs):
+        return
+
+    def teardown_test_environment(self, **kwargs):
+        return
+
+
+class DiscoverRunnerExtraTestsDeprecationTests(SimpleTestCase):
+    msg = 'The extra_tests argument is deprecated.'
+
+    def get_runner(self):
+        return NoOpTestRunner(verbosity=0, interactive=False)
+
+    def test_extra_tests_build_suite(self):
+        runner = self.get_runner()
+        with self.assertWarnsMessage(RemovedInDjango50Warning, self.msg):
+            runner.build_suite(extra_tests=[])
+
+    def test_extra_tests_run_tests(self):
+        runner = self.get_runner()
+        with captured_stderr():
+            with self.assertWarnsMessage(RemovedInDjango50Warning, self.msg):
+                runner.run_tests(
+                    test_labels=['test_runner_apps.sample.tests_sample.EmptyTestCase'],
+                    extra_tests=[],
+                )

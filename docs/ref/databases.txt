@@ -686,16 +686,16 @@ a :exc:`~django.db.NotSupportedError` is raised.
 =============== ========= ==========
 Option          MariaDB   MySQL
 =============== ========= ==========
-``SKIP LOCKED``           X (≥8.0.1)
+``SKIP LOCKED`` X (≥10.6) X (≥8.0.1)
 ``NOWAIT``      X (≥10.3) X (≥8.0.1)
 ``OF``                    X (≥8.0.1)
 ``NO KEY``
 =============== ========= ==========
 
 When using ``select_for_update()`` on MySQL, make sure you filter a queryset
-against at least set of fields contained in unique constraints or only against
-fields covered by indexes. Otherwise, an exclusive write lock will be acquired
-over the full table for the duration of the transaction.
+against at least a set of fields contained in unique constraints or only
+against fields covered by indexes. Otherwise, an exclusive write lock will be
+acquired over the full table for the duration of the transaction.
 
 Automatic typecasting can cause unexpected results
 --------------------------------------------------
